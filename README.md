@@ -29,7 +29,7 @@ Installation
 For node.js or the browser with [browserify](https://github.com/substack/node-browserify) or [webpack](https://github.com/webpack/webpack).
 
 ```
-npm install ddpay
+npm install ddpays
 ```
 
 ### From cdn or self-hosted script
@@ -138,7 +138,7 @@ stream.pipe(es.map(function(block, callback) {
 Bundling
 --------
 
-The easiest way to bundle ddpay (with browserify, webpack etc.) is to just `npm install ddpay` and `require('ddpay')` which will give you well-tested (see browser compatibility matrix above) pre-bundled code guaranteed to JustWork™. However, that is not always desirable since it will not allow your bundler to de-duplicate any shared dependencies ddpay and your app might have.
+The easiest way to bundle ddpay (with browserify, webpack etc.) is to just `npm install ddpays` and `require('ddpays')` which will give you well-tested (see browser compatibility matrix above) pre-bundled code guaranteed to JustWork™. However, that is not always desirable since it will not allow your bundler to de-duplicate any shared dependencies ddpay and your app might have.
 
 To allow for deduplication you can `require('ddpay/lib/index-browser')`, or if you plan to provide your own polyfills: `require('ddpay/lib/index')`. See `src/index-browser.ts` for a list of polyfills expected.
 
