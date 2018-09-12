@@ -18,7 +18,7 @@ Robust [dPay blockchain](https://dpays.io) client library that runs in both node
 Browser compatibility
 ---------------------
 
-[![Build Status](https://saucelabs.com/browser-matrix/jnordberg-ddpay.svg)](https://saucelabs.com/open_sauce/user/jnordberg-ddpay)
+[![Build Status](https://saucelabs.com/browser-matrix/dpays-ddpay.svg)](https://saucelabs.com/open_sauce/user/dpays-ddpay)
 
 
 Installation
