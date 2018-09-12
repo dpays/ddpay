@@ -1,0 +1,298 @@
+/**
+ * @file dPay RPC client implementation.
+ * @author dPay Labs <labs@dpays.io>
+ * @license
+ * Copyright (c) 2017 Johan Nordberg. All Rights Reserved.
+ * Copyright (c) 2018 dPay Labs. All Rights Reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without modification,
+ * are permitted provided that the following conditions are met:
+ *
+ *  1. Redistribution of source code must retain the above copyright notice, this
+ *     list of conditions and the following disclaimer.
+ *
+ *  2. Redistribution in binary form must reproduce the above copyright notice,
+ *     this list of conditions and the following disclaimer in the documentation
+ *     and/or other materials provided with the distribution.
+ *
+ *  3. Neither the name of the copyright holder nor the names of its contributors
+ *     may be used to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+ * INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+ * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+ * OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ * You acknowledge that this software is not designed, licensed or intended for use
+ * in the design, construction, operation or maintenance of any military facility.
+ */
+
+import * as assert from 'assert'
+import {EventEmitter} from 'events'
+import * as http from 'http'
+import * as https from 'https'
+import {parse as parseUrl, Url} from 'url'
+import {VError} from 'verror'
+import packageVersion from './version'
+
+import {Blockchain} from './helpers/blockchain'
+import {BroadcastAPI} from './helpers/broadcast'
+import {DatabaseAPI} from './helpers/database'
+import {copy, jsonRequest, waitForEvent} from './utils'
+
+/**
+ * Library version.
+ */
+export const VERSION = packageVersion
+
+/**
+ * Main dPay network chain id.
+ */
+export const DEFAULT_CHAIN_ID = Buffer.from('38f14b346eb697ba04ae0f5adcfaa0a437ed3711197704aa256a14cb9b4a8f26', 'hex')
+
+/**
+ * Main dPay network address prefix.
+ */
+export const DEFAULT_ADDRESS_PREFIX = 'DWB'
+
+interface RPCRequest {
+    /**
+     * Request sequence number.
+     */
+    id: number
+    /**
+     * RPC method.
+     */
+    method: 'call' | 'notice' | 'callback'
+    /**
+     * Array of parameters to pass to the method.
+     */
+    params: any[]
+}
+
+interface RPCCall extends RPCRequest {
+    method: 'call'
+    /**
+     * 1. API to call, you can pass either the numerical id of the API you get
+     *    from calling 'get_api_by_name' or the name directly as a string.
+     * 2. Method to call on that API.
+     * 3. Arguments to pass to the method.
+     */
+    params: [number|string, string, any[]]
+}
+
+interface RPCError {
+    code: number
+    message: string
+    data?: any
+}
+
+interface RPCResponse {
+    /**
+     * Response sequence number, corresponding to request sequence number.
+     */
+    id: number
+    error?: RPCError
+    result?: any
+}
+
+interface PendingRequest {
+    request: RPCRequest,
+    timer: NodeJS.Timer | undefined
+    resolve: (response: any) => void
+    reject: (error: Error) => void
+}
+
+/**
+ * RPC Client options
+ * ------------------
+ */
+export interface ClientOptions {
+    /**
+     * dPay chain id. Defaults to main dPay network:
+     * `38f14b346eb697ba04ae0f5adcfaa0a437ed3711197704aa256a14cb9b4a8f26`
+     */
+    chainId?: string
+    /**
+     * dPay address prefix. Defaults to main dPay network:
+     * `DWB`
+     */
+    addressPrefix?: string
+    /**
+     * How long in milliseconds before a request times out, set to `0` to disable.
+     * Defaults to five seconds.
+     */
+    sendTimeout?: number
+    /**
+     * Node.js http(s) agent, use if you want http keep-alive.
+     * Defaults to using https.globalAgent.
+     * @see https://nodejs.org/api/http.html#http_new_agent_options.
+     */
+    agent?: https.Agent
+}
+
+/**
+ * RPC Client events
+ * -----------------
+ */
+export interface ClientEvents {
+    /**
+     * Emitted when the connection closes/opens.
+     */
+    on(event: 'open' | 'close', listener: () => void): this
+    /**
+     * Emitted on error, throws if there is no listener.
+     */
+    on(event: 'error', listener: (error: Error) => void): this
+    /**
+     * Emitted when receiving a server notice message, typically only used for callbacks.
+     */
+    on(event: 'notice', listener: (notice: any) => void): this
+    on(event: string, listener: Function): this
+}
+
+/**
+ * RPC Client
+ * ----------
+ * Can be used in both node.js and the browser. Also see {@link ClientOptions}.
+ */
+export class Client extends EventEmitter implements ClientEvents {
+
+    /**
+     * Create a new client instance configured for the testnet.
+     */
+    public static testnet(options?: ClientOptions) {
+        let opts: ClientOptions = {}
+        if (options) {
+            opts = copy(options)
+            opts.agent = options.agent
+        }
+        opts.addressPrefix = 'DWT'
+        opts.chainId = '79276aea5d4877d9a25892eaa01b0adf019d3e5cb12a97478df3298ccdd01673'
+        return new Client('https://dpaytest.network', opts)
+    }
+
+    /**
+     * Client options, *read-only*.
+     */
+    public readonly options: ClientOptions
+
+    /**
+     * Address to dPay RPC server, *read-only*.
+     */
+    public readonly address: string
+
+    /**
+     * Database API helper.
+     */
+    public readonly database: DatabaseAPI
+
+    /**
+     * Broadcast API helper.
+     */
+    public readonly broadcast: BroadcastAPI
+
+    /**
+     * Blockchain helper.
+     */
+    public readonly blockchain: Blockchain
+
+    /**
+     * Chain ID for current network.
+     */
+    public readonly chainId: Buffer
+
+    /**
+     * Address prefix for current network.
+     */
+    public readonly addressPrefix: string
+
+    private pending = new Map<number, PendingRequest>()
+    private seqNo: number = 0
+    private rpcOptions: https.RequestOptions
+
+    /**
+     * @param address The address to the dPay RPC server, e.g. `https://d.dpays.io`.
+     * @param options Client options.
+     */
+    constructor(address: string, options: ClientOptions = {}) {
+        super()
+
+        this.address = address
+        this.options = options
+
+        const url = parseUrl(address, false)
+        assert(url.protocol !== 'wss:' && url.protocol !== 'ws:', 'websocket support deprecated')
+
+        this.rpcOptions = url as https.RequestOptions
+        this.rpcOptions.agent = options.agent
+        this.rpcOptions.method = 'post'
+        this.rpcOptions.headers = {
+            'User-Agent': `ddpay/${ VERSION }`
+        }
+
+        const timeout = options.sendTimeout || 5 * 1000
+        if (timeout !== 0) {
+            this.rpcOptions.timeout = options.sendTimeout
+        }
+
+        this.chainId = options.chainId ? Buffer.from(options.chainId, 'hex') : DEFAULT_CHAIN_ID
+        assert.equal(this.chainId.length, 32, 'invalid chain id')
+        this.addressPrefix = options.addressPrefix || DEFAULT_ADDRESS_PREFIX
+
+        this.database = new DatabaseAPI(this)
+        this.broadcast = new BroadcastAPI(this)
+        this.blockchain = new Blockchain(this)
+    }
+
+    /**
+     * Make a RPC call to the server.
+     *
+     * @param api     The API to call, e.g. `database_api`.
+     * @param method  The API method, e.g. `get_dynamic_global_properties`.
+     * @param params  Array of parameters to pass to the method, optional.
+     *
+     */
+    public async call(api: string, method: string, params: any[] = []): Promise<any> {
+        const request: RPCCall = {
+            id: ++this.seqNo,
+            method: 'call',
+            params: [api, method, params],
+        }
+        const response = await jsonRequest(this.rpcOptions, request) as RPCResponse
+        if (response.error) {
+            const {data} = response.error
+            let {message} = response.error
+            if (data && data.stack && data.stack.length > 0) {
+                const top = data.stack[0]
+                const topData = copy(top.data)
+                message = top.format.replace(/\$\{([a-z_]+)\}/gi, (match: string, key: string) => {
+                    let rv = match
+                    if (topData[key]) {
+                        rv = topData[key]
+                        delete topData[key]
+                    }
+                    return rv
+                })
+                const unformattedData = Object.keys(topData)
+                    .map((key) => ({key, value: topData[key]}))
+                    .filter((item) => typeof item.value === 'string')
+                    .map((item) => `${ item.key }=${ item.value}`)
+                if (unformattedData.length > 0) {
+                    message += ' ' + unformattedData.join(' ')
+                }
+            }
+            throw new VError({info: data, name: 'RPCError'}, message)
+        }
+        assert.equal(response.id, request.id, 'got invalid response id')
+        return response.result
+    }
+
+}
