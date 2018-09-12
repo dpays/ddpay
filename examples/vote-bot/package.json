@@ -1,0 +1,6 @@
+{
+  "private": "true",
+  "dependencies": {
+    "ddpay": "^0.3.0"
+  }
+}
